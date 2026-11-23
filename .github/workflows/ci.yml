@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  INGRESS_NGINX: https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.3/deploy/static/provider/kind/deploy.yaml
+  METRICS_SERVER: https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
+  KUBECONFORM_VERSION: v0.6.7
+
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest -q
+      - name: ShellCheck
+        run: shellcheck scripts/*.sh
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+      - name: Install kubeconform
+        run: |
+          curl -sSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar xz -C /usr/local/bin kubeconform
+      - name: helm lint
+        run: |
+          helm lint helm/app
+          helm lint helm/app -f helm/app/values-dev.yaml
+          helm lint helm/app -f helm/app/values-prod.yaml
+      # Renders the chart to plain YAML and checks it against the Kubernetes
+      # schemas. The CRD catalog covers the ServiceMonitor (prod values).
+      - name: helm template | kubeconform
+        run: |
+          for values in values-dev.yaml values-prod.yaml; do
+            echo "== $values"
+            helm template app helm/app -f "helm/app/$values" \
+              | kubeconform -strict -summary -kubernetes-version 1.31.0 \
+                  -schema-location default \
+                  -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+          done
+      - name: kubeconform on the Prometheus manifest
+        run: kubeconform -strict -summary -kubernetes-version 1.31.0 k8s/monitoring/prometheus.yaml
+
+  kind:
+    needs: [app, chart]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the images
+        run: |
+          docker build -t k8s-platform-app:1.0.0 .
+          docker build --build-arg BROKEN=1 -t k8s-platform-app:broken .
+
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: lab
+          config: kind/cluster.yaml
+          version: v0.24.0
+
+      - name: Load the images into the cluster
+        run: kind load docker-image k8s-platform-app:1.0.0 k8s-platform-app:broken --name lab
+
+      - name: Install ingress-nginx
+        run: |
+          kubectl apply -f "$INGRESS_NGINX"
+          kubectl -n ingress-nginx rollout status deploy/ingress-nginx-controller --timeout=180s
+
+      # kind nodes use self-signed kubelet certificates, hence the extra flag.
+      - name: Install metrics-server
+        run: |
+          kubectl apply -f "$METRICS_SERVER"
+          kubectl -n kube-system patch deploy metrics-server --type=json \
+            -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+          kubectl -n kube-system rollout status deploy/metrics-server --timeout=120s
+
+      - name: Create the Secret the chart points at
+        run: |
+          kubectl create secret generic app-secret \
+            --from-literal=API_KEY="$(openssl rand -hex 16)"
+
+      - name: helm upgrade --install
+        run: |
+          helm upgrade --install app helm/app -f helm/app/values-dev.yaml --wait --timeout 120s
+          kubectl rollout status deploy/app-app --timeout=120s
+          kubectl get deploy,svc,ingress,hpa,pdb,pods
+
+      - name: Smoke test through the ingress
+        run: |
+          # The ingress admission webhook can take a moment to route.
+          for i in $(seq 1 20); do
+            curl -sf -H "Host: app.local" http://localhost/health && break
+            sleep 3
+          done
+          echo
+          curl -sf -H "Host: app.local" http://localhost/ | tee /tmp/index.json
+          echo
+          jq -e '.environment == "dev" and .api_key_set == true' /tmp/index.json
+          curl -sf -H "Host: app.local" http://localhost/ready
+          echo
+          curl -sf -H "Host: app.local" http://localhost/metrics | grep app_requests_total
+
+      - name: HPA status
+        run: |
+          for i in $(seq 1 24); do
+            kubectl get hpa app-app --no-headers | tee /tmp/hpa.txt
+            grep -q unknown /tmp/hpa.txt || break
+            sleep 5
+          done
+          kubectl describe hpa app-app | sed -n '1,30p'
+          kubectl top pods
+
+      - name: Prometheus sees the app
+        run: |
+          kubectl apply -f k8s/monitoring/prometheus.yaml
+          kubectl -n monitoring rollout status deploy/prometheus --timeout=120s
+          kubectl -n monitoring port-forward svc/prometheus 9090:9090 > /tmp/pf.log 2>&1 &
+          sleep 5
+          for i in $(seq 1 20); do
+            UP="$(curl -sf 'http://localhost:9090/api/v1/query?query=up%7Bjob%3D%22app%22%7D' \
+              | jq '[.data.result[] | select(.value[1] == "1")] | length')" || UP=0
+            echo "targets up: $UP"
+            [ "$UP" -ge 2 ] && break
+            sleep 5
+          done
+          [ "$UP" -ge 2 ]
+          curl -sf 'http://localhost:9090/api/v1/query?query=up%7Bjob%3D%22app%22%7D' | jq -c '.data.result[] | {pod: .metric.pod, up: .value[1]}'
+
+      - name: Rollback demo
+        run: bash scripts/rollback-demo.sh
+
+      - name: Cluster state on failure
+        if: failure()
+        run: |
+          kubectl get all -A
+          kubectl describe pods -l app.kubernetes.io/name=app | tail -n 80
+          kubectl -n ingress-nginx logs deploy/ingress-nginx-controller --tail=50
