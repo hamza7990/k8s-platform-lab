@@ -1,0 +1,29 @@
+replicaCount: 3
+
+config:
+  APP_ENV: prod
+  GREETING: hello from prod
+
+ingress:
+  host: app.example.com
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+autoscaling:
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 60
+
+podDisruptionBudget:
+  minAvailable: 2
+
+serviceMonitor:
+  enabled: true
+
+minReadySeconds: 10

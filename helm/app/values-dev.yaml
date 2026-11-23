@@ -1,0 +1,9 @@
+replicaCount: 2
+
+config:
+  APP_ENV: dev
+  GREETING: hello from dev
+
+autoscaling:
+  minReplicas: 2
+  maxReplicas: 3

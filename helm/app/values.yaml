@@ -1,0 +1,54 @@
+# Defaults. values-dev.yaml and values-prod.yaml override some of these.
+
+replicaCount: 2
+
+image:
+  repository: k8s-platform-app
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+
+# Plain settings, stored in a ConfigMap and passed as environment variables.
+config:
+  APP_ENV: dev
+  GREETING: hello from kubernetes
+
+# The Secret is NOT created by this chart. It must exist already and have
+# the key API_KEY. The chart only points at it.
+secret:
+  name: app-secret
+  key: API_KEY
+
+service:
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: nginx
+  host: app.local
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Needs the Prometheus Operator CRDs, so it is off by default.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+
+# Seconds a new pod must be ready before it counts as available.
+minReadySeconds: 0
